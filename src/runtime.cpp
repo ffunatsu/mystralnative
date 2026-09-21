@@ -164,6 +164,7 @@ public:
         , running_(true)  // Start as running so pollEvents() works without run()
         , width_(config.width)
         , height_(config.height)
+        , fullscreen_(config.fullscreen)
     {}
 
     ~RuntimeImpl() override {
@@ -847,6 +848,7 @@ public:
     void setFullscreen(bool fullscreen) override {
         std::cout << "[Mystral] Fullscreen: " << (fullscreen ? "true" : "false") << std::endl;
         platform::setFullscreen(fullscreen);
+        fullscreen_ = fullscreen;
     }
 
     int getWidth() const override { return width_; }
@@ -3380,6 +3382,7 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int exitCode_ = 0;  // Exit code set by process.exit()
     int width_;
     int height_;
+    bool fullscreen_;
 
     std::unique_ptr<webgpu::Context> webgpu_;
     std::unique_ptr<js::Engine> jsEngine_;
@@ -3771,6 +3774,33 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // Set 'self' to point to global object (required by Three.js and other libs)
         // In browsers, 'self' refers to the global object (same as 'this' at global scope)
         jsEngine_->setGlobalProperty("self", window);
+
+        // Mystral-native window controls. This is intentionally not a DOM API.
+        auto mystral = jsEngine_->newObject();
+        jsEngine_->setProperty(mystral, "setFullscreen",
+            jsEngine_->newFunction("setFullscreen", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                bool enabled = !fullscreen_;
+                if (!args.empty()) enabled = jsEngine_->toBoolean(args[0]);
+                setFullscreen(enabled);
+                return jsEngine_->newUndefined();
+            })
+        );
+        jsEngine_->setProperty(mystral, "toggleFullscreen",
+            jsEngine_->newFunction("toggleFullscreen", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                setFullscreen(!fullscreen_);
+                return jsEngine_->newUndefined();
+            })
+        );
+        jsEngine_->setProperty(mystral, "getWindowSize",
+            jsEngine_->newFunction("getWindowSize", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                auto size = jsEngine_->newObject();
+                jsEngine_->setProperty(size, "width", jsEngine_->newNumber(width_));
+                jsEngine_->setProperty(size, "height", jsEngine_->newNumber(height_));
+                return size;
+            })
+        );
+        jsEngine_->setProperty(mystral, "isFullscreen", jsEngine_->newBoolean(fullscreen_));
+        jsEngine_->setGlobalProperty("mystral", mystral);
 
         // Also set document as window.document (browsers have both)
         jsEngine_->setProperty(window, "document", document);
