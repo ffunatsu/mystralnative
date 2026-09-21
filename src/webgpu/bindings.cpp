@@ -1436,6 +1436,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (!g_engine->isUndefined(heightVal)) height = (uint32_t)g_engine->toNumber(heightVal);
                             }
 
+                            if (dataPtr && dataSize == (size_t)width * height * 4) {
+                                imgWidth = (int)width;
+                                imgHeight = (int)height;
+                            }
+
                             // Handle flipY, premultipliedAlpha, and/or BGRA channel swap by writing
                             // into a staging copy. RGBA8 only (matches the hardcoded bytesPerRow below).
                             std::vector<uint8_t> stagingData;
