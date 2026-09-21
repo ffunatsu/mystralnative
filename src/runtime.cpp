@@ -764,6 +764,8 @@ public:
             }
         }
 
+        applyPendingResize();
+
         // Poll libuv event loop - process any ready I/O callbacks (non-blocking)
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
@@ -3383,6 +3385,9 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int width_;
     int height_;
     bool fullscreen_;
+    bool pendingResize_ = false;
+    int pendingResizeWidth_ = 0;
+    int pendingResizeHeight_ = 0;
 
     std::unique_ptr<webgpu::Context> webgpu_;
     std::unique_ptr<js::Engine> jsEngine_;
@@ -4077,19 +4082,28 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     }
 
     void dispatchResizeEvent(const platform::ResizeEventData& e) {
-        // Update internal dimensions
-        width_ = e.width;
-        height_ = e.height;
+        pendingResizeWidth_ = e.width;
+        pendingResizeHeight_ = e.height;
+        pendingResize_ = true;
+    }
+
+    void applyPendingResize() {
+        if (!pendingResize_) return;
+        pendingResize_ = false;
+
+        width_ = pendingResizeWidth_;
+        height_ = pendingResizeHeight_;
 
         // Update window.innerWidth/innerHeight
         auto window = jsEngine_->getGlobal();
-        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(e.width));
-        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(e.height));
+        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(width_));
+        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(height_));
 
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString("resize"));
 
         dispatchToListeners("window", "resize", event);
+
     }
 
     void dispatchToListeners(const std::string& target, const std::string& eventType, js::JSValueHandle event) {
