@@ -996,6 +996,7 @@ set(MYSTRAL_SOURCES
     src/webtransport/webtransport_polyfill.cpp
     src/net/websocket_client.cpp
     src/net/websocket_server.cpp
+    src/net/udp_socket.cpp
     src/fs/async_file.cpp
     src/fs/file_watcher.cpp
     src/gltf/gltf_loader.cpp

@@ -9,6 +9,7 @@
 #include "mystral/webtransport/webtransport.h"
 #include "mystral/net/websocket_client.h"
 #include "mystral/net/websocket_server.h"
+#include "mystral/net/udp_socket.h"
 #include "mystral/fs/async_file.h"
 #include "mystral/fs/file_watcher.h"
 #include "mystral/gltf/gltf_loader.h"
@@ -428,6 +429,9 @@ public:
         // Set up WebSocket server API (ws:// only, no TLS)
         net::initWebSocketServerBindings(jsEngine_.get());
 
+        // Set up raw UDP socket API
+        net::initUDPBindings(jsEngine_.get());
+
         // Set up URL parsing and Worker polyfill (needed for Draco decoder, etc.)
         setupURL();
 
@@ -493,6 +497,7 @@ public:
         // Initialize WebTransport subsystem (QUIC sockets are created lazily)
         webtransport::init();
         net::initWebSocketNetworking();
+        net::initUDPNetworking();
 
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
@@ -521,6 +526,7 @@ public:
         webtransport::shutdown();
         net::shutdownWebSocketNetworking();
         net::shutdownWebSocketServers();
+        net::shutdownUDPNetworking();
 
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
@@ -730,7 +736,8 @@ public:
                 bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
                                webtransport::hasActiveSessions() ||
                                net::hasActiveWebSockets() ||
-                               net::hasActiveWebSocketServers();
+                               net::hasActiveWebSocketServers() ||
+                               net::hasActiveUDPSockets();
                 if (!hasWork) {
                     idleFrames++;
                     if (idleFrames >= maxIdleFrames) {
@@ -800,6 +807,9 @@ public:
 
         // Dispatch queued WebSocket server events (connections accepted via libuv callbacks)
         net::processWebSocketServerEvents();
+
+        // Poll UDP sockets and dispatch datagrams on the main thread
+        net::processUDPEvents();
 
         // Process completed async file reads (queues their callbacks)
         // Note: We don't process the pending callbacks immediately because we might
