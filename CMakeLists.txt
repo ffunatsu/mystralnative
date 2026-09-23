@@ -1010,6 +1010,12 @@ set(MYSTRAL_SOURCES
     src/video/gpu_readback_recorder.cpp
 )
 
+if(WIN32)
+    list(APPEND MYSTRAL_SOURCES
+        ${THIRD_PARTY_DIR}/libsharedmemory/libsharedmemory_windows.cpp
+    )
+endif()
+
 # Ray tracing sources (conditional)
 if(MYSTRAL_USE_RAYTRACING)
     list(APPEND MYSTRAL_SOURCES
@@ -1054,6 +1060,7 @@ target_include_directories(mystral-runtime PUBLIC
 target_include_directories(mystral-runtime PRIVATE
     ${THIRD_PARTY_DIR}/stb
     ${THIRD_PARTY_DIR}/cgltf
+    ${THIRD_PARTY_DIR}/libsharedmemory
 )
 
 # Pass build configuration to source code

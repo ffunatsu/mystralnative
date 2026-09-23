@@ -16,6 +16,7 @@
 #include "mystral/vfs/embedded_bundle.h"
 #include "mystral/async/event_loop.h"
 #include "storage/local_storage.h"
+#include "libsharedmemory.hpp"
 
 // Ray tracing bindings (conditional)
 #ifdef MYSTRAL_HAS_RAYTRACING
@@ -84,6 +85,7 @@ namespace mystral { namespace webgpu {
 // Platform-specific includes for crash handler
 #ifdef _WIN32
 #include <io.h>
+extern "C" int __cdecl _write(int fd, const void* buffer, unsigned int count);
 #define MYSTRAL_WRITE(fd, buf, len) _write(fd, buf, len)
 #define MYSTRAL_STDERR_FD 2
 #else
@@ -437,6 +439,9 @@ public:
 
         // Set up localStorage/sessionStorage (file-backed persistence)
         setupStorage();
+
+        // Set up SharedMemory reader/writer bridge
+        setupSharedMemory();
 
         // Set up native GLTF loading API
         // This provides loadGLTF() for loading .glb/.gltf files from local paths
@@ -1486,6 +1491,170 @@ private:
 )JS";
 
         jsEngine_->eval(storagePolyfill, "storage-polyfill.js");
+    }
+
+    void setupSharedMemory() {
+        if (!jsEngine_) return;
+
+        jsEngine_->setGlobalProperty("__sharedMemoryCreateReader",
+            jsEngine_->newFunction("__sharedMemoryCreateReader", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNumber(-1);
+
+                try {
+                    const std::string name = jsEngine_->toString(args[0]);
+                    const std::size_t size = static_cast<std::size_t>(jsEngine_->toNumber(args.size() > 1 ? args[1] : jsEngine_->newNumber(65535)));
+                    const bool persist = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+
+                    int id = nextSharedMemoryHandle_++;
+                    sharedMemoryReaders_[id] = std::make_unique<lsm::SharedMemoryReadStream>(name, size, persist);
+                    return jsEngine_->newNumber(id);
+                } catch (const std::exception&) {
+                    return jsEngine_->newNumber(-1);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryCreateWriter",
+            jsEngine_->newFunction("__sharedMemoryCreateWriter", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNumber(-1);
+
+                try {
+                    const std::string name = jsEngine_->toString(args[0]);
+                    const std::size_t size = static_cast<std::size_t>(jsEngine_->toNumber(args.size() > 1 ? args[1] : jsEngine_->newNumber(65535)));
+                    const bool persist = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+
+                    int id = nextSharedMemoryHandle_++;
+                    sharedMemoryWriters_[id] = std::make_unique<lsm::SharedMemoryWriteStream>(name, size, persist);
+                    return jsEngine_->newNumber(id);
+                } catch (const std::exception&) {
+                    return jsEngine_->newNumber(-1);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryWriteString",
+            jsEngine_->newFunction("__sharedMemoryWriteString", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.size() < 2) return jsEngine_->newBoolean(false);
+
+                try {
+                    const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                    const std::string value = jsEngine_->toString(args[1]);
+                    auto it = sharedMemoryWriters_.find(id);
+                    if (it == sharedMemoryWriters_.end() || !it->second) {
+                        return jsEngine_->newBoolean(false);
+                    }
+                    it->second->write(value);
+                    return jsEngine_->newBoolean(true);
+                } catch (const std::exception&) {
+                    return jsEngine_->newBoolean(false);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryReadString",
+            jsEngine_->newFunction("__sharedMemoryReadString", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNull();
+
+                try {
+                    const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                    auto it = sharedMemoryReaders_.find(id);
+                    if (it == sharedMemoryReaders_.end() || !it->second) {
+                        return jsEngine_->newNull();
+                    }
+                    return jsEngine_->newString(it->second->readString().c_str());
+                } catch (const std::exception&) {
+                    return jsEngine_->newNull();
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryClose",
+            jsEngine_->newFunction("__sharedMemoryClose", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newBoolean(false);
+
+                const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                bool closed = false;
+
+                auto writerIt = sharedMemoryWriters_.find(id);
+                if (writerIt != sharedMemoryWriters_.end()) {
+                    if (writerIt->second) {
+                        writerIt->second->close();
+                    }
+                    sharedMemoryWriters_.erase(writerIt);
+                    closed = true;
+                }
+
+                auto readerIt = sharedMemoryReaders_.find(id);
+                if (readerIt != sharedMemoryReaders_.end()) {
+                    if (readerIt->second) {
+                        readerIt->second->close();
+                    }
+                    sharedMemoryReaders_.erase(readerIt);
+                    closed = true;
+                }
+
+                return jsEngine_->newBoolean(closed);
+            })
+        );
+
+        const char* sharedMemoryPolyfill = R"JS(
+(function() {
+    class SharedMemoryWriter {
+        constructor(name, size = 65535, persistent = false) {
+            this.name = String(name);
+            this.size = Number(size) || 65535;
+            this.persistent = !!persistent;
+            this._id = __sharedMemoryCreateWriter(this.name, this.size, this.persistent);
+            if (this._id < 0) {
+                throw new Error('Failed to create shared memory writer');
+            }
+        }
+
+        writeString(value) {
+            return __sharedMemoryWriteString(this._id, String(value));
+        }
+
+        close() {
+            if (this._id >= 0) {
+                __sharedMemoryClose(this._id);
+                this._id = -1;
+            }
+        }
+    }
+
+    class SharedMemoryReader {
+        constructor(name, size = 65535, persistent = false) {
+            this.name = String(name);
+            this.size = Number(size) || 65535;
+            this.persistent = !!persistent;
+            this._id = __sharedMemoryCreateReader(this.name, this.size, this.persistent);
+            if (this._id < 0) {
+                throw new Error('Failed to open shared memory reader');
+            }
+        }
+
+        readString() {
+            return __sharedMemoryReadString(this._id);
+        }
+
+        close() {
+            if (this._id >= 0) {
+                __sharedMemoryClose(this._id);
+                this._id = -1;
+            }
+        }
+    }
+
+    globalThis.SharedMemoryWriter = SharedMemoryWriter;
+    globalThis.SharedMemoryReader = SharedMemoryReader;
+    globalThis.SharedMemory = {
+        Writer: SharedMemoryWriter,
+        Reader: SharedMemoryReader
+    };
+})();
+)JS";
+
+        jsEngine_->eval(sharedMemoryPolyfill, "shared-memory-polyfill.js");
     }
 
     void setupFetch() {
@@ -3412,6 +3581,9 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     std::unique_ptr<js::Engine> jsEngine_;
     std::unique_ptr<js::ModuleSystem> moduleSystem_;
     storage::LocalStorage localStorage_;
+    std::unordered_map<int, std::unique_ptr<lsm::SharedMemoryWriteStream>> sharedMemoryWriters_;
+    std::unordered_map<int, std::unique_ptr<lsm::SharedMemoryReadStream>> sharedMemoryReaders_;
+    int nextSharedMemoryHandle_ = 1;
 
     // requestAnimationFrame state
     struct RAFCallback {
