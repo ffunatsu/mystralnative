@@ -7,6 +7,7 @@
 #include "mystral/http/http_client.h"
 #include "mystral/http/async_http_client.h"
 #include "mystral/webtransport/webtransport.h"
+#include "mystral/net/websocket_client.h"
 #include "mystral/fs/async_file.h"
 #include "mystral/fs/file_watcher.h"
 #include "mystral/gltf/gltf_loader.h"
@@ -418,6 +419,9 @@ public:
         // Set up WebTransport API (QUIC/HTTP3 via quiche; stubbed if not built)
         webtransport::initBindings(jsEngine_.get());
 
+        // Set up WebSocket client API (ws:// only, no TLS)
+        net::initWebSocketBindings(jsEngine_.get());
+
         // Set up URL parsing and Worker polyfill (needed for Draco decoder, etc.)
         setupURL();
 
@@ -479,6 +483,7 @@ public:
 
         // Initialize WebTransport subsystem (QUIC sockets are created lazily)
         webtransport::init();
+        net::initWebSocketNetworking();
 
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
@@ -505,6 +510,7 @@ public:
 
         // Shut down WebTransport sessions (closes QUIC connections + uv handles)
         webtransport::shutdown();
+        net::shutdownWebSocketNetworking();
 
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
@@ -712,7 +718,8 @@ public:
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
                 bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
-                               webtransport::hasActiveSessions();
+                               webtransport::hasActiveSessions() ||
+                               net::hasActiveWebSockets();
                 if (!hasWork) {
                     idleFrames++;
                     if (idleFrames >= maxIdleFrames) {
@@ -776,6 +783,9 @@ public:
 
         // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
         webtransport::processEvents();
+
+        // Poll WebSocket client sockets and dispatch their JS events (main thread)
+        net::processWebSocketEvents();
 
         // Process completed async file reads (queues their callbacks)
         // Note: We don't process the pending callbacks immediately because we might
