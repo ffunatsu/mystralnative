@@ -4128,9 +4128,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                     // device.lost - Promise that resolves when the device is lost
                     // Required by Three.js WebGPU renderer during init
-                    // We create a Promise that never resolves (device never lost in normal operation)
+                    // The native runtime does not currently expose device-loss callbacks.
+                    // Keep this placeholder pending instead of reporting a false loss.
                     auto deviceLostPromise = g_engine->evalWithResult(
-                        "new Promise(function(resolve) { globalThis.__mystral_device_lost_resolve = resolve; })",
+                        "new Promise(function() {})",
                         "device.lost"
                     );
                     g_engine->setProperty(device, "lost", deviceLostPromise);
