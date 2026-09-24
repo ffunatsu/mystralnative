@@ -52,6 +52,7 @@ struct FfiFunction {
 
 struct ConvertedArgument {
     const char* stringValue = nullptr;
+    std::string stringStorage;
     void* pointerValue = nullptr;
     int intValue = 0;
     size_t sizeValue = 0;
@@ -182,7 +183,8 @@ bool convertArgument(v8::Isolate* isolate,
             throwError(isolate, "Could not convert string argument");
             return false;
         }
-        out.stringValue = *text;
+        out.stringStorage = *text;
+        out.stringValue = out.stringStorage.c_str();
         return true;
     }
     case FfiType::Pointer:
