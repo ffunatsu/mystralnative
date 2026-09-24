@@ -105,6 +105,98 @@ extern "C" int __cdecl _write(int fd, const void* buffer, unsigned int count);
 
 namespace mystral {
 
+struct NativeFileStream {
+    std::string path;
+    std::ifstream stream;
+    std::uint64_t size = 0;
+    std::uint64_t offset = 0;
+
+    static std::string normalizePath(const std::string& input) {
+        std::string path = input;
+        if (path.rfind("file://", 0) == 0) {
+            path.erase(0, 7);
+        }
+        return path;
+    }
+
+    bool open(const std::string& inputPath) {
+        path = normalizePath(inputPath);
+        stream.open(path, std::ios::binary | std::ios::in);
+        if (!stream.is_open()) {
+            return false;
+        }
+
+        stream.seekg(0, std::ios::end);
+        const std::streamoff endPos = stream.tellg();
+        if (endPos < 0) {
+            return false;
+        }
+        size = static_cast<std::uint64_t>(endPos);
+        stream.seekg(0, std::ios::beg);
+        offset = 0;
+        return true;
+    }
+
+    bool seek(std::uint64_t newOffset) {
+        if (!stream.is_open()) return false;
+        if (newOffset > size) return false;
+        stream.seekg(static_cast<std::streamoff>(newOffset), std::ios::beg);
+        offset = newOffset;
+        return true;
+    }
+
+    std::uint64_t tell() const {
+        return offset;
+    }
+
+    std::uint64_t available() const {
+        return size > offset ? (size - offset) : 0;
+    }
+
+    std::vector<uint8_t> read(std::uint64_t count) {
+        if (!stream.is_open()) return {};
+        const std::uint64_t readCount = std::min<std::uint64_t>(count, available());
+        if (readCount == 0) return {};
+
+        std::vector<uint8_t> buffer(readCount);
+        stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(readCount));
+        if (stream.gcount() <= 0) {
+            return {};
+        }
+
+        offset += static_cast<std::uint64_t>(stream.gcount());
+        buffer.resize(static_cast<std::size_t>(stream.gcount()));
+        return buffer;
+    }
+
+    std::vector<uint8_t> readSlice(std::uint64_t start, std::uint64_t count) {
+        if (!stream.is_open()) return {};
+        if (start > size) return {};
+
+        const std::uint64_t safeCount = std::min<std::uint64_t>(count, size - start);
+        std::vector<uint8_t> buffer(safeCount);
+
+        const std::uint64_t previous = offset;
+        stream.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+        stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(safeCount));
+        stream.seekg(static_cast<std::streamoff>(previous), std::ios::beg);
+        if (stream.gcount() <= 0) {
+            return {};
+        }
+
+        buffer.resize(static_cast<std::size_t>(stream.gcount()));
+        return buffer;
+    }
+
+    void close() {
+        if (stream.is_open()) {
+            stream.close();
+        }
+        size = 0;
+        offset = 0;
+    }
+};
+
 // Flag to suppress crash dialogs (always on by default)
 static bool g_suppressCrashDialog = true;
 
@@ -503,6 +595,9 @@ public:
         return true;
     }
 
+    std::unordered_map<int64_t, std::shared_ptr<NativeFileStream>> fileStreams_;
+    int64_t nextFileStreamId_ = 1;
+
     void shutdown() {
         std::cout << "[Mystral] Shutting down runtime..." << std::endl;
         running_ = false;
@@ -521,6 +616,14 @@ public:
 
         // Shutdown file watcher
         fs::getFileWatcher().shutdown();
+
+        // Close all generic native file streams before JS engine teardown
+        for (auto& [id, stream] : fileStreams_) {
+            if (stream) {
+                stream->close();
+            }
+        }
+        fileStreams_.clear();
 
         // Shut down WebTransport sessions (closes QUIC connections + uv handles)
         webtransport::shutdown();
@@ -579,6 +682,8 @@ public:
             jsEngine_->gc();  // Run twice for good measure
         }
 
+        nextFileStreamId_ = 1;
+        fileStreams_.clear();
         jsEngine_.reset();    // Release JS engine
         webgpu_.reset();      // Release WebGPU resources
         if (!config_.noSdl) {
@@ -4006,6 +4111,85 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
             })
         );
         jsEngine_->setProperty(mystral, "isFullscreen", jsEngine_->newBoolean(fullscreen_));
+
+        jsEngine_->setProperty(mystral, "openFileStream",
+            jsEngine_->newFunction("openFileStream", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) {
+                    return jsEngine_->newNull();
+                }
+
+                const std::string path = NativeFileStream::normalizePath(jsEngine_->toString(args[0]));
+                auto stream = std::make_shared<NativeFileStream>();
+                if (!stream->open(path)) {
+                    std::cerr << "[Mystral] Failed to open file stream: " << path << std::endl;
+                    return jsEngine_->newNull();
+                }
+
+                const int64_t id = nextFileStreamId_++;
+                fileStreams_[id] = stream;
+
+                auto streamObj = jsEngine_->newObject();
+                jsEngine_->setProperty(streamObj, "id", jsEngine_->newNumber(static_cast<double>(id)));
+                jsEngine_->setProperty(streamObj, "path", jsEngine_->newString(path.c_str()));
+                jsEngine_->setProperty(streamObj, "size", jsEngine_->newNumber(static_cast<double>(stream->size)));
+                jsEngine_->setProperty(streamObj, "tell",
+                    jsEngine_->newFunction("tell", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNumber(0.0);
+                        return jsEngine_->newNumber(static_cast<double>(it->second->tell()));
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "seek",
+                    jsEngine_->newFunction("seek", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        if (args.empty()) return jsEngine_->newBoolean(false);
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newBoolean(false);
+                        const std::uint64_t offset = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        return jsEngine_->newBoolean(it->second->seek(offset));
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "read",
+                    jsEngine_->newFunction("read", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNull();
+                        std::uint64_t count = it->second->available();
+                        if (!args.empty()) {
+                            count = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        }
+                        const std::vector<uint8_t> data = it->second->read(count);
+                        if (data.empty()) {
+                            return jsEngine_->newArrayBuffer(nullptr, 0);
+                        }
+                        return jsEngine_->newArrayBuffer(const_cast<uint8_t*>(data.data()), data.size());
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "readSlice",
+                    jsEngine_->newFunction("readSlice", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        if (args.size() < 2) return jsEngine_->newNull();
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNull();
+                        const std::uint64_t start = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        const std::uint64_t count = static_cast<std::uint64_t>(jsEngine_->toNumber(args[1]));
+                        const std::vector<uint8_t> data = it->second->readSlice(start, count);
+                        if (data.empty()) {
+                            return jsEngine_->newArrayBuffer(nullptr, 0);
+                        }
+                        return jsEngine_->newArrayBuffer(const_cast<uint8_t*>(data.data()), data.size());
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "close",
+                    jsEngine_->newFunction("close", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        auto it = fileStreams_.find(id);
+                        if (it != fileStreams_.end()) {
+                            it->second->close();
+                            fileStreams_.erase(it);
+                        }
+                        return jsEngine_->newUndefined();
+                    })
+                );
+                return streamObj;
+            })
+        );
         jsEngine_->setGlobalProperty("mystral", mystral);
 
         // Also set document as window.document (browsers have both)
