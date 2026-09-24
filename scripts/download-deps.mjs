@@ -478,14 +478,6 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-// Convert Windows path to MSYS/Git-bash compatible path
-// D:\path\to\file -> /d/path/to/file
-function toUnixPath(windowsPath) {
-  if (process.platform !== 'win32') return windowsPath;
-  // Replace drive letter D:\ with /d/
-  return windowsPath.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`).replace(/\\/g, '/');
-}
-
 async function extractArchive(archivePath, destDir) {
   console.log(`Extracting: ${archivePath} -> ${destDir}`);
 
@@ -496,14 +488,9 @@ async function extractArchive(archivePath, destDir) {
   if (archivePath.endsWith('.zip')) {
     execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'inherit' });
   } else if (archivePath.endsWith('.tar.gz') || archivePath.endsWith('.tgz')) {
-    // On Windows with git-bash, tar needs Unix-style paths
-    const unixArchive = toUnixPath(archivePath);
-    const unixDest = toUnixPath(destDir);
-    execSync(`tar -xzf "${unixArchive}" -C "${unixDest}"`, { stdio: 'inherit' });
+    execSync(`tar -xzf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
   } else if (archivePath.endsWith('.tar.xz')) {
-    const unixArchive = toUnixPath(archivePath);
-    const unixDest = toUnixPath(destDir);
-    execSync(`tar -xJf "${unixArchive}" -C "${unixDest}"`, { stdio: 'inherit' });
+    execSync(`tar -xJf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
   } else if (archivePath.endsWith('.7z')) {
     // 7z format - requires p7zip (brew install p7zip on macOS)
     try {
