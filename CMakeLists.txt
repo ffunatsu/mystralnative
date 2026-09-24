@@ -1062,6 +1062,8 @@ target_include_directories(mystral-runtime PRIVATE
     ${THIRD_PARTY_DIR}/stb
     ${THIRD_PARTY_DIR}/cgltf
     ${THIRD_PARTY_DIR}/libsharedmemory
+    ${THIRD_PARTY_DIR}/infix/include
+    ${THIRD_PARTY_DIR}/infix/src
 )
 
 # Pass build configuration to source code
@@ -1147,7 +1149,10 @@ if(MYSTRAL_USE_V8 AND TARGET v8::v8)
     target_sources(mystral-runtime PRIVATE
         src/js/v8_engine.cpp
         src/js/v8_ffi_bindings.cpp
+        ${THIRD_PARTY_DIR}/infix/src/infix.c
     )
+    set_source_files_properties(${THIRD_PARTY_DIR}/infix/src/infix.c PROPERTIES LANGUAGE C)
+    set_property(TARGET mystral-runtime PROPERTY C_STANDARD 17)
     # V8 requires C++20 - force it at target level for MSVC
     # MSVC needs /Zc:__cplusplus to report the correct __cplusplus value
     # (V8 checks __cplusplus <= 201703L which fails without this flag)

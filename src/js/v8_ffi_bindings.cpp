@@ -8,7 +8,9 @@
 #else
 #include <dlfcn.h>
 #endif
+#include <infix/infix.h>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -45,6 +47,8 @@ using FfiAddress = void*;
 struct FfiFunction {
     FfiLibrary* library = nullptr;
     FfiAddress address = nullptr;
+    infix_forward_t* trampoline = nullptr;
+    infix_cif_func call = nullptr;
     FfiType returnType = FfiType::Void;
     std::vector<FfiType> argumentTypes;
     std::string name;
@@ -58,6 +62,14 @@ struct ConvertedArgument {
     size_t sizeValue = 0;
     float floatValue = 0.0f;
     double doubleValue = 0.0;
+};
+
+union ReturnValue {
+    int intValue;
+    size_t sizeValue;
+    float floatValue;
+    double doubleValue;
+    void* pointerValue;
 };
 
 bool hasSuffix(const std::string& value, const char* suffix) {
@@ -214,9 +226,17 @@ bool convertArgument(v8::Isolate* isolate,
         out.sizeValue = static_cast<size_t>(value->IntegerValue(isolate->GetCurrentContext()).FromMaybe(0));
         return true;
     case FfiType::Float:
+        if (!value->IsNumber()) {
+            throwError(isolate, "Expected a float argument");
+            return false;
+        }
         out.floatValue = static_cast<float>(value->NumberValue(isolate->GetCurrentContext()).FromMaybe(0));
         return true;
     case FfiType::Double:
+        if (!value->IsNumber()) {
+            throwError(isolate, "Expected a double argument");
+            return false;
+        }
         out.doubleValue = value->NumberValue(isolate->GetCurrentContext()).FromMaybe(0);
         return true;
     case FfiType::Void:
@@ -226,14 +246,57 @@ bool convertArgument(v8::Isolate* isolate,
     return false;
 }
 
-v8::Local<v8::Value> makeReturnValue(v8::Isolate* isolate, FfiType type, uintptr_t value) {
+const char* infixTypeName(FfiType type, bool returnType) {
+    switch (type) {
+    case FfiType::Void: return returnType ? "void" : nullptr;
+    case FfiType::Int: return "int";
+    case FfiType::SizeT: return "size_t";
+    case FfiType::Float: return "float";
+    case FfiType::Double: return "double";
+    case FfiType::String: return returnType ? "*char" : "*char";
+    case FfiType::Pointer:
+    case FfiType::Buffer: return "*void";
+    }
+    return nullptr;
+}
+
+std::string makeSignature(FfiType returnType, const std::vector<FfiType>& argumentTypes) {
+    std::ostringstream signature;
+    signature << "(";
+    for (size_t i = 0; i < argumentTypes.size(); ++i) {
+        if (i != 0) signature << ", ";
+        signature << infixTypeName(argumentTypes[i], false);
+    }
+    signature << ") -> " << infixTypeName(returnType, true);
+    return signature.str();
+}
+
+void* argumentAddress(ConvertedArgument& argument, FfiType type) {
+    switch (type) {
+    case FfiType::String: return &argument.stringValue;
+    case FfiType::Pointer:
+    case FfiType::Buffer: return &argument.pointerValue;
+    case FfiType::Int: return &argument.intValue;
+    case FfiType::SizeT: return &argument.sizeValue;
+    case FfiType::Float: return &argument.floatValue;
+    case FfiType::Double: return &argument.doubleValue;
+    case FfiType::Void: return nullptr;
+    }
+    return nullptr;
+}
+
+v8::Local<v8::Value> makeReturnValue(v8::Isolate* isolate, FfiType type, const ReturnValue& value) {
     switch (type) {
     case FfiType::Void: return v8::Undefined(isolate);
-    case FfiType::Int: return v8::Integer::New(isolate, static_cast<int32_t>(value));
-    case FfiType::SizeT: return v8::BigInt::NewFromUnsigned(isolate, static_cast<uint64_t>(value));
-    case FfiType::Pointer: return v8::External::New(isolate, reinterpret_cast<void*>(value));
-    default: return v8::Undefined(isolate);
+    case FfiType::Int: return v8::Integer::New(isolate, value.intValue);
+    case FfiType::SizeT: return v8::BigInt::NewFromUnsigned(isolate, static_cast<uint64_t>(value.sizeValue));
+    case FfiType::Float: return v8::Number::New(isolate, value.floatValue);
+    case FfiType::Double: return v8::Number::New(isolate, value.doubleValue);
+    case FfiType::Pointer: return v8::External::New(isolate, value.pointerValue);
+    case FfiType::String: return v8String(isolate, value.pointerValue ? static_cast<const char*>(value.pointerValue) : "");
+    case FfiType::Buffer: return v8::Undefined(isolate);
     }
+    return v8::Undefined(isolate);
 }
 
 void invokeFunction(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -254,37 +317,13 @@ void invokeFunction(const v8::FunctionCallbackInfo<v8::Value>& info) {
         }
     }
 
-    // This first FFI slice intentionally covers the common C ABI shapes used by
-    // device APIs. dyncall/libffi can replace this dispatcher when more shapes
-    // (structs, callbacks, and arbitrary signatures) are added.
-    uintptr_t result = 0;
-    const auto argCount = function->argumentTypes.size();
-
-    if (argCount == 0) {
-        switch (function->returnType) {
-        case FfiType::Void: reinterpret_cast<void(*)()>(function->address)(); break;
-        case FfiType::Int: result = static_cast<uintptr_t>(reinterpret_cast<int(*)()>(function->address)()); break;
-        case FfiType::SizeT: result = reinterpret_cast<size_t(*)()>(function->address)(); break;
-        case FfiType::Pointer: result = reinterpret_cast<uintptr_t>(reinterpret_cast<void*(*)()>(function->address)()); break;
-        default: throwError(isolate, "Unsupported zero-argument return type"); return;
-        }
-    } else if (argCount == 2 && function->argumentTypes[0] == FfiType::String &&
-               function->argumentTypes[1] == FfiType::Int && function->returnType == FfiType::Pointer) {
-        result = reinterpret_cast<uintptr_t>(reinterpret_cast<void*(*)(const char*, int)>(function->address)(
-            args[0].stringValue, args[1].intValue));
-    } else if (argCount == 3 && function->argumentTypes[0] == FfiType::Pointer &&
-               function->argumentTypes[1] == FfiType::Buffer && function->argumentTypes[2] == FfiType::SizeT &&
-               function->returnType == FfiType::Int) {
-        result = static_cast<uintptr_t>(reinterpret_cast<int(*)(void*, const void*, size_t)>(function->address)(
-            args[0].pointerValue, args[1].pointerValue, args[2].sizeValue));
-    } else if (argCount == 1 && function->argumentTypes[0] == FfiType::Pointer &&
-               function->returnType == FfiType::Void) {
-        reinterpret_cast<void(*)(void*)>(function->address)(args[0].pointerValue);
-    } else {
-        throwError(isolate, "Unsupported FFI signature for " + function->name);
-        return;
+    std::vector<void*> argumentPointers(args.size());
+    for (size_t i = 0; i < args.size(); ++i) {
+        argumentPointers[i] = argumentAddress(args[i], function->argumentTypes[i]);
     }
 
+    ReturnValue result{};
+    function->call(&result, argumentPointers.empty() ? nullptr : argumentPointers.data());
     info.GetReturnValue().Set(makeReturnValue(isolate, function->returnType, result));
 }
 
@@ -328,6 +367,26 @@ void functionCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
             return;
         }
         function->argumentTypes.push_back(type);
+    }
+
+    const std::string signature = makeSignature(function->returnType, function->argumentTypes);
+    const infix_status status = infix_forward_create(
+        &function->trampoline, signature.c_str(), reinterpret_cast<void*>(address), nullptr);
+    if (status != INFIX_SUCCESS) {
+        const infix_error_details_t error = infix_get_last_error();
+        const std::string message = error.message[0] ? error.message : "unknown infix error";
+        const std::string functionName = function->name;
+        delete function;
+        throwError(isolate, "Could not create FFI trampoline for " + functionName + ": " + message);
+        return;
+    }
+    function->call = infix_forward_get_code(function->trampoline);
+    if (!function->call) {
+        const std::string functionName = function->name;
+        infix_forward_destroy(function->trampoline);
+        delete function;
+        throwError(isolate, "Could not get FFI trampoline for " + functionName);
+        return;
     }
 
     auto functionTemplate = v8::FunctionTemplate::New(
