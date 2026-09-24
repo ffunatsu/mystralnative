@@ -492,15 +492,15 @@ async function extractArchive(archivePath, destDir) {
   } else if (archivePath.endsWith('.tar.xz')) {
     execSync(`tar -xJf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
   } else if (archivePath.endsWith('.7z')) {
-    // 7z format - requires p7zip (brew install p7zip on macOS)
-    try {
+    if (process.platform === 'win32') {
+      try {
+        execSync(`tar -xf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
+      } catch (tarError) {
+        console.warn('Windows tar could not extract the 7z archive; trying 7z.');
+        execSync(`7z x "${archivePath}" -o"${destDir}" -y`, { stdio: 'inherit' });
+      }
+    } else {
       execSync(`7z x "${archivePath}" -o"${destDir}" -y`, { stdio: 'inherit' });
-    } catch (e) {
-      console.error('7z extraction failed. Install p7zip:');
-      console.error('  macOS: brew install p7zip');
-      console.error('  Linux: sudo apt install p7zip-full');
-      console.error('  Windows: Install 7-Zip and add to PATH');
-      throw e;
     }
   } else if (archivePath.endsWith('.dmg')) {
     // macOS DMG - mount, copy, unmount
