@@ -3,6 +3,7 @@
 #include "mystral/platform/input.h"
 #include "mystral/webgpu/context.h"
 #include "mystral/js/engine.h"
+#include "mystral/js/v8_ffi_bindings.h"
 #include "mystral/js/module_system.h"
 #include "mystral/http/http_client.h"
 #include "mystral/http/async_http_client.h"
@@ -532,6 +533,14 @@ public:
 
         // Set up DOM event system (document, window, addEventListener, etc.)
         setupDOMEvents();
+
+    #if defined(MYSTRAL_JS_V8)
+        // setupDOMEvents creates the mystral namespace, so install FFI after it.
+        if (!js::initV8FfiBindings(jsEngine_.get())) {
+            std::cerr << "[Mystral] Failed to initialize V8 FFI bindings" << std::endl;
+            return false;
+        }
+    #endif
 
         // Set up localStorage/sessionStorage (file-backed persistence)
         setupStorage();

@@ -1144,7 +1144,10 @@ if(MYSTRAL_USE_QUICKJS AND TARGET quickjs)
 endif()
 
 if(MYSTRAL_USE_V8 AND TARGET v8::v8)
-    target_sources(mystral-runtime PRIVATE src/js/v8_engine.cpp)
+    target_sources(mystral-runtime PRIVATE
+        src/js/v8_engine.cpp
+        src/js/v8_ffi_bindings.cpp
+    )
     # V8 requires C++20 - force it at target level for MSVC
     # MSVC needs /Zc:__cplusplus to report the correct __cplusplus value
     # (V8 checks __cplusplus <= 201703L which fails without this flag)
@@ -1165,6 +1168,9 @@ if(MYSTRAL_USE_V8 AND TARGET v8::v8)
         target_link_libraries(mystral-runtime PRIVATE ${COREFOUNDATION_FRAMEWORK})
     elseif(V8_SYSTEM_LIBS)
         target_link_libraries(mystral-runtime PRIVATE ${V8_SYSTEM_LIBS})
+    endif()
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(mystral-runtime PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 
