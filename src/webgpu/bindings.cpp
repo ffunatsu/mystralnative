@@ -40,6 +40,7 @@
 
 // Canvas 2D context (Skia-backed)
 #include "mystral/canvas/canvas2d.h"
+#include "mystral/webgpu/context.h"
 
 // Forward declaration for Canvas2D bindings
 namespace mystral {
@@ -224,6 +225,14 @@ static const char* formatToString(WGPUTextureFormat format) {
         case WGPUTextureFormat_BGRA8UnormSrgb: return "bgra8unorm-srgb";
         case WGPUTextureFormat_RGBA8Unorm: return "rgba8unorm";
         case WGPUTextureFormat_RGBA8UnormSrgb: return "rgba8unorm-srgb";
+        case WGPUTextureFormat_BC1RGBAUnorm: return "bc1-rgba-unorm";
+        case WGPUTextureFormat_BC1RGBAUnormSrgb: return "bc1-rgba-unorm-srgb";
+        case WGPUTextureFormat_BC2RGBAUnorm: return "bc2-rgba-unorm";
+        case WGPUTextureFormat_BC2RGBAUnormSrgb: return "bc2-rgba-unorm-srgb";
+        case WGPUTextureFormat_BC3RGBAUnorm: return "bc3-rgba-unorm";
+        case WGPUTextureFormat_BC3RGBAUnormSrgb: return "bc3-rgba-unorm-srgb";
+        case WGPUTextureFormat_BC7RGBAUnorm: return "bc7-rgba-unorm";
+        case WGPUTextureFormat_BC7RGBAUnormSrgb: return "bc7-rgba-unorm-srgb";
         case WGPUTextureFormat_R8Unorm: return "r8unorm";
         case WGPUTextureFormat_RG8Unorm: return "rg8unorm";
         case WGPUTextureFormat_R16Float: return "r16float";
@@ -247,6 +256,14 @@ static WGPUTextureFormat stringToFormat(const std::string& format) {
     if (format == "bgra8unorm-srgb") return WGPUTextureFormat_BGRA8UnormSrgb;
     if (format == "rgba8unorm") return WGPUTextureFormat_RGBA8Unorm;
     if (format == "rgba8unorm-srgb") return WGPUTextureFormat_RGBA8UnormSrgb;
+    if (format == "bc1-rgba-unorm") return WGPUTextureFormat_BC1RGBAUnorm;
+    if (format == "bc1-rgba-unorm-srgb") return WGPUTextureFormat_BC1RGBAUnormSrgb;
+    if (format == "bc2-rgba-unorm") return WGPUTextureFormat_BC2RGBAUnorm;
+    if (format == "bc2-rgba-unorm-srgb") return WGPUTextureFormat_BC2RGBAUnormSrgb;
+    if (format == "bc3-rgba-unorm") return WGPUTextureFormat_BC3RGBAUnorm;
+    if (format == "bc3-rgba-unorm-srgb") return WGPUTextureFormat_BC3RGBAUnormSrgb;
+    if (format == "bc7-rgba-unorm") return WGPUTextureFormat_BC7RGBAUnorm;
+    if (format == "bc7-rgba-unorm-srgb") return WGPUTextureFormat_BC7RGBAUnormSrgb;
     if (format == "r8unorm") return WGPUTextureFormat_R8Unorm;
     if (format == "rg8unorm") return WGPUTextureFormat_RG8Unorm;
     if (format == "r16float") return WGPUTextureFormat_R16Float;
@@ -1698,6 +1715,11 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 if (!g_engine->isUndefined(heightVal)) height = (uint32_t)g_engine->toNumber(heightVal);
                             }
 
+                            if (dataPtr && dataSize == (size_t)width * height * 4) {
+                                imgWidth = (int)width;
+                                imgHeight = (int)height;
+                            }
+
                             // Handle flipY, premultipliedAlpha, and/or BGRA channel swap by writing
                             // into a staging copy. RGBA8 only (matches the hardcoded bytesPerRow below).
                             std::vector<uint8_t> stagingData;
@@ -1804,6 +1826,9 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                             // indirect-first-instance enables non-zero firstInstance in indirect draws
                             if (featureName == "indirect-first-instance") {
                                 return g_engine->newBoolean(true);
+                            }
+                            if (featureName == "texture-compression-bc") {
+                                return g_engine->newBoolean(isTextureCompressionBCSupported());
                             }
                             // timestamp-query is NOT supported yet - bindings not implemented
                             return g_engine->newBoolean(false);
@@ -4385,9 +4410,10 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
 
                     // device.lost - Promise that resolves when the device is lost
                     // Required by Three.js WebGPU renderer during init
-                    // We create a Promise that never resolves (device never lost in normal operation)
+                    // The native runtime does not currently expose device-loss callbacks.
+                    // Keep this placeholder pending instead of reporting a false loss.
                     auto deviceLostPromise = g_engine->evalWithResult(
-                        "new Promise(function(resolve) { globalThis.__mystral_device_lost_resolve = resolve; })",
+                        "new Promise(function() {})",
                         "device.lost"
                     );
                     g_engine->setProperty(device, "lost", deviceLostPromise);
@@ -4412,11 +4438,15 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                     if (featureName == "indirect-first-instance") {
                         return g_engine->newBoolean(true);
                     }
+                    if (featureName == "texture-compression-bc") {
+                        return g_engine->newBoolean(isTextureCompressionBCSupported());
+                    }
                     // timestamp-query is NOT supported yet - bindings not implemented
                     return g_engine->newBoolean(false);
                 })
             );
-            g_engine->setProperty(features, "size", g_engine->newNumber(1));
+            g_engine->setProperty(features, "size",
+                g_engine->newNumber(isTextureCompressionBCSupported() ? 2 : 1));
             g_engine->setProperty(adapter, "features", features);
 
             // adapter.limits

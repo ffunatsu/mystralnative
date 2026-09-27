@@ -318,6 +318,12 @@ public:
      * - JSC: JSGlobalContextRef
      */
     virtual void* getRawContext() = 0;
+
+    /**
+     * Get an optional handle to the engine's raw global context.
+     * V8 uses this during initialization when no context is currently entered.
+     */
+    virtual void* getRawContextHandle() { return nullptr; }
 };
 
 /**

@@ -96,6 +96,12 @@ WGPUBool wgpuDevicePoll(WGPUDevice device, WGPUBool wait, WGPUWrappedSubmissionI
 namespace mystral {
 namespace webgpu {
 
+static bool g_textureCompressionBCSupported = false;
+
+bool isTextureCompressionBCSupported() {
+    return g_textureCompressionBCSupported;
+}
+
 // Callback data for async operations
 struct AdapterRequestData {
     WGPUAdapter adapter = nullptr;
@@ -319,6 +325,9 @@ bool Context::initializeHeadless() {
         return false;
     }
     adapter_ = adapterData.adapter;
+    g_textureCompressionBCSupported = wgpuAdapterHasFeature(
+        adapter_, WGPUFeatureName_TextureCompressionBC
+    );
 
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
@@ -349,12 +358,15 @@ bool Context::initializeHeadless() {
     WGPULimits requiredLimits = adapterLimits;
     deviceDesc.requiredLimits = &requiredLimits;
 
-    static WGPUFeatureName requiredFeaturesDawn[1];
+    static WGPUFeatureName requiredFeaturesDawn[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
         featureCount = 1;
         hasIndirectFirstInstance_ = true;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesDawn[featureCount++] = WGPUFeatureName_TextureCompressionBC;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
@@ -365,12 +377,15 @@ bool Context::initializeHeadless() {
     requiredLimits.limits = adapterLimits.limits;
     deviceDesc.requiredLimits = &requiredLimits;
 
-    static WGPUFeatureName requiredFeaturesWGPU[1];
+    static WGPUFeatureName requiredFeaturesWGPU[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
         featureCount = 1;
         hasIndirectFirstInstance_ = true;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesWGPU[featureCount++] = WGPUFeatureName_TextureCompressionBC;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
@@ -578,6 +593,9 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
         return false;
     }
     adapter_ = adapterData.adapter;
+    g_textureCompressionBCSupported = wgpuAdapterHasFeature(
+        adapter_, WGPUFeatureName_TextureCompressionBC
+    );
 
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
@@ -625,7 +643,7 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 
     // Check if IndirectFirstInstance is supported before requesting it
     // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesDawn[1];
+    static WGPUFeatureName requiredFeaturesDawn[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
@@ -635,6 +653,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     } else {
         hasIndirectFirstInstance_ = false;
         std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesDawn[featureCount++] = WGPUFeatureName_TextureCompressionBC;
+        std::cout << "[WebGPU] Requesting TextureCompressionBC feature (supported)" << std::endl;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
@@ -657,7 +679,7 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
 
     // Check if IndirectFirstInstance is supported before requesting it
     // This feature allows instance_index in shaders to include firstInstance offset
-    static WGPUFeatureName requiredFeaturesWGPU[1];
+    static WGPUFeatureName requiredFeaturesWGPU[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
@@ -667,6 +689,10 @@ bool Context::createSurface(void* nativeHandle, int platformType) {
     } else {
         hasIndirectFirstInstance_ = false;
         std::cout << "[WebGPU] IndirectFirstInstance feature NOT supported (continuing without)" << std::endl;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesWGPU[featureCount++] = WGPUFeatureName_TextureCompressionBC;
+        std::cout << "[WebGPU] Requesting TextureCompressionBC feature (supported)" << std::endl;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;
@@ -806,6 +832,9 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
         return false;
     }
     adapter_ = adapterData.adapter;
+    g_textureCompressionBCSupported = wgpuAdapterHasFeature(
+        adapter_, WGPUFeatureName_TextureCompressionBC
+    );
 
     // Print adapter info
     WGPUAdapterInfo adapterInfo = {};
@@ -841,12 +870,15 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
     }
     deviceDesc.requiredLimits = &requiredLimits;
 
-    static WGPUFeatureName requiredFeaturesDawn[1];
+    static WGPUFeatureName requiredFeaturesDawn[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesDawn[0] = WGPUFeatureName_IndirectFirstInstance;
         featureCount = 1;
         hasIndirectFirstInstance_ = true;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesDawn[featureCount++] = WGPUFeatureName_TextureCompressionBC;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesDawn : nullptr;
@@ -861,12 +893,15 @@ bool Context::createSurfaceWithDescriptor(WGPUSurfaceDescriptor& surfaceDesc) {
     }
     deviceDesc.requiredLimits = &requiredLimits;
 
-    static WGPUFeatureName requiredFeaturesWGPU[1];
+    static WGPUFeatureName requiredFeaturesWGPU[2];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_IndirectFirstInstance)) {
         requiredFeaturesWGPU[0] = WGPUFeatureName_IndirectFirstInstance;
         featureCount = 1;
         hasIndirectFirstInstance_ = true;
+    }
+    if (g_textureCompressionBCSupported) {
+        requiredFeaturesWGPU[featureCount++] = WGPUFeatureName_TextureCompressionBC;
     }
     deviceDesc.requiredFeatureCount = featureCount;
     deviceDesc.requiredFeatures = featureCount > 0 ? requiredFeaturesWGPU : nullptr;

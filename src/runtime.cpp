@@ -3,10 +3,14 @@
 #include "mystral/platform/input.h"
 #include "mystral/webgpu/context.h"
 #include "mystral/js/engine.h"
+#include "mystral/js/v8_ffi_bindings.h"
 #include "mystral/js/module_system.h"
 #include "mystral/http/http_client.h"
 #include "mystral/http/async_http_client.h"
 #include "mystral/webtransport/webtransport.h"
+#include "mystral/net/websocket_client.h"
+#include "mystral/net/websocket_server.h"
+#include "mystral/net/udp_socket.h"
 #include "mystral/fs/async_file.h"
 #include "mystral/fs/file_watcher.h"
 #include "mystral/gltf/gltf_loader.h"
@@ -14,6 +18,7 @@
 #include "mystral/vfs/embedded_bundle.h"
 #include "mystral/async/event_loop.h"
 #include "storage/local_storage.h"
+#include "libsharedmemory.hpp"
 
 // Ray tracing bindings (conditional)
 #ifdef MYSTRAL_HAS_RAYTRACING
@@ -82,6 +87,7 @@ namespace mystral { namespace webgpu {
 // Platform-specific includes for crash handler
 #ifdef _WIN32
 #include <io.h>
+extern "C" int __cdecl _write(int fd, const void* buffer, unsigned int count);
 #define MYSTRAL_WRITE(fd, buf, len) _write(fd, buf, len)
 #define MYSTRAL_STDERR_FD 2
 #else
@@ -99,6 +105,98 @@ namespace mystral { namespace webgpu {
 #include <SDL3/SDL.h>
 
 namespace mystral {
+
+struct NativeFileStream {
+    std::string path;
+    std::ifstream stream;
+    std::uint64_t size = 0;
+    std::uint64_t offset = 0;
+
+    static std::string normalizePath(const std::string& input) {
+        std::string path = input;
+        if (path.rfind("file://", 0) == 0) {
+            path.erase(0, 7);
+        }
+        return path;
+    }
+
+    bool open(const std::string& inputPath) {
+        path = normalizePath(inputPath);
+        stream.open(path, std::ios::binary | std::ios::in);
+        if (!stream.is_open()) {
+            return false;
+        }
+
+        stream.seekg(0, std::ios::end);
+        const std::streamoff endPos = stream.tellg();
+        if (endPos < 0) {
+            return false;
+        }
+        size = static_cast<std::uint64_t>(endPos);
+        stream.seekg(0, std::ios::beg);
+        offset = 0;
+        return true;
+    }
+
+    bool seek(std::uint64_t newOffset) {
+        if (!stream.is_open()) return false;
+        if (newOffset > size) return false;
+        stream.seekg(static_cast<std::streamoff>(newOffset), std::ios::beg);
+        offset = newOffset;
+        return true;
+    }
+
+    std::uint64_t tell() const {
+        return offset;
+    }
+
+    std::uint64_t available() const {
+        return size > offset ? (size - offset) : 0;
+    }
+
+    std::vector<uint8_t> read(std::uint64_t count) {
+        if (!stream.is_open()) return {};
+        const std::uint64_t readCount = std::min<std::uint64_t>(count, available());
+        if (readCount == 0) return {};
+
+        std::vector<uint8_t> buffer(readCount);
+        stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(readCount));
+        if (stream.gcount() <= 0) {
+            return {};
+        }
+
+        offset += static_cast<std::uint64_t>(stream.gcount());
+        buffer.resize(static_cast<std::size_t>(stream.gcount()));
+        return buffer;
+    }
+
+    std::vector<uint8_t> readSlice(std::uint64_t start, std::uint64_t count) {
+        if (!stream.is_open()) return {};
+        if (start > size) return {};
+
+        const std::uint64_t safeCount = std::min<std::uint64_t>(count, size - start);
+        std::vector<uint8_t> buffer(safeCount);
+
+        const std::uint64_t previous = offset;
+        stream.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+        stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(safeCount));
+        stream.seekg(static_cast<std::streamoff>(previous), std::ios::beg);
+        if (stream.gcount() <= 0) {
+            return {};
+        }
+
+        buffer.resize(static_cast<std::size_t>(stream.gcount()));
+        return buffer;
+    }
+
+    void close() {
+        if (stream.is_open()) {
+            stream.close();
+        }
+        size = 0;
+        offset = 0;
+    }
+};
 
 // Flag to suppress crash dialogs (always on by default)
 static bool g_suppressCrashDialog = true;
@@ -164,6 +262,7 @@ public:
         , running_(true)  // Start as running so pollEvents() works without run()
         , width_(config.width)
         , height_(config.height)
+        , fullscreen_(config.fullscreen)
     {}
 
     ~RuntimeImpl() override {
@@ -417,6 +516,15 @@ public:
         // Set up WebTransport API (QUIC/HTTP3 via quiche; stubbed if not built)
         webtransport::initBindings(jsEngine_.get());
 
+        // Set up WebSocket client API (ws:// only, no TLS)
+        net::initWebSocketBindings(jsEngine_.get());
+
+        // Set up WebSocket server API (ws:// only, no TLS)
+        net::initWebSocketServerBindings(jsEngine_.get());
+
+        // Set up raw UDP socket API
+        net::initUDPBindings(jsEngine_.get());
+
         // Set up URL parsing and Worker polyfill (needed for Draco decoder, etc.)
         setupURL();
 
@@ -426,8 +534,19 @@ public:
         // Set up DOM event system (document, window, addEventListener, etc.)
         setupDOMEvents();
 
+    #if defined(MYSTRAL_JS_V8)
+        // setupDOMEvents creates the mystral namespace, so install FFI after it.
+        if (!js::initV8FfiBindings(jsEngine_.get())) {
+            std::cerr << "[Mystral] Failed to initialize V8 FFI bindings" << std::endl;
+            return false;
+        }
+    #endif
+
         // Set up localStorage/sessionStorage (file-backed persistence)
         setupStorage();
+
+        // Set up SharedMemory reader/writer bridge
+        setupSharedMemory();
 
         // Set up native GLTF loading API
         // This provides loadGLTF() for loading .glb/.gltf files from local paths
@@ -478,10 +597,15 @@ public:
 
         // Initialize WebTransport subsystem (QUIC sockets are created lazily)
         webtransport::init();
+        net::initWebSocketNetworking();
+        net::initUDPNetworking();
 
         std::cout << "[Mystral] Runtime initialized" << std::endl;
         return true;
     }
+
+    std::unordered_map<int64_t, std::shared_ptr<NativeFileStream>> fileStreams_;
+    int64_t nextFileStreamId_ = 1;
 
     void shutdown() {
         std::cout << "[Mystral] Shutting down runtime..." << std::endl;
@@ -502,8 +626,19 @@ public:
         // Shutdown file watcher
         fs::getFileWatcher().shutdown();
 
+        // Close all generic native file streams before JS engine teardown
+        for (auto& [id, stream] : fileStreams_) {
+            if (stream) {
+                stream->close();
+            }
+        }
+        fileStreams_.clear();
+
         // Shut down WebTransport sessions (closes QUIC connections + uv handles)
         webtransport::shutdown();
+        net::shutdownWebSocketNetworking();
+        net::shutdownWebSocketServers();
+        net::shutdownUDPNetworking();
 
 #ifdef MYSTRAL_USE_LIBUV_TIMERS
         // Clean up libuv timers before shutting down the event loop
@@ -556,6 +691,8 @@ public:
             jsEngine_->gc();  // Run twice for good measure
         }
 
+        nextFileStreamId_ = 1;
+        fileStreams_.clear();
         jsEngine_.reset();    // Release JS engine
         webgpu_.reset();      // Release WebGPU resources
         if (!config_.noSdl) {
@@ -711,7 +848,10 @@ public:
             // In no-SDL (headless) mode, exit when there's no more work to do
             if (config_.noSdl) {
                 bool hasWork = !rafCallbacks_.empty() || hasActiveTimers() ||
-                               webtransport::hasActiveSessions();
+                               webtransport::hasActiveSessions() ||
+                               net::hasActiveWebSockets() ||
+                               net::hasActiveWebSocketServers() ||
+                               net::hasActiveUDPSockets();
                 if (!hasWork) {
                     idleFrames++;
                     if (idleFrames >= maxIdleFrames) {
@@ -763,6 +903,8 @@ public:
             }
         }
 
+        applyPendingResize();
+
         // Poll libuv event loop - process any ready I/O callbacks (non-blocking)
         // This handles async HTTP requests, file I/O, and libuv-based timers
         async::EventLoop::instance().runOnce();
@@ -773,6 +915,15 @@ public:
 
         // Drive WebTransport QUIC sessions and dispatch their JS events (main thread)
         webtransport::processEvents();
+
+        // Poll WebSocket client sockets and dispatch their JS events (main thread)
+        net::processWebSocketEvents();
+
+        // Dispatch queued WebSocket server events (connections accepted via libuv callbacks)
+        net::processWebSocketServerEvents();
+
+        // Poll UDP sockets and dispatch datagrams on the main thread
+        net::processUDPEvents();
 
         // Process completed async file reads (queues their callbacks)
         // Note: We don't process the pending callbacks immediately because we might
@@ -847,6 +998,7 @@ public:
     void setFullscreen(bool fullscreen) override {
         std::cout << "[Mystral] Fullscreen: " << (fullscreen ? "true" : "false") << std::endl;
         platform::setFullscreen(fullscreen);
+        fullscreen_ = fullscreen;
     }
 
     int getWidth() const override { return width_; }
@@ -1463,6 +1615,170 @@ private:
 )JS";
 
         jsEngine_->eval(storagePolyfill, "storage-polyfill.js");
+    }
+
+    void setupSharedMemory() {
+        if (!jsEngine_) return;
+
+        jsEngine_->setGlobalProperty("__sharedMemoryCreateReader",
+            jsEngine_->newFunction("__sharedMemoryCreateReader", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNumber(-1);
+
+                try {
+                    const std::string name = jsEngine_->toString(args[0]);
+                    const std::size_t size = static_cast<std::size_t>(jsEngine_->toNumber(args.size() > 1 ? args[1] : jsEngine_->newNumber(65535)));
+                    const bool persist = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+
+                    int id = nextSharedMemoryHandle_++;
+                    sharedMemoryReaders_[id] = std::make_unique<lsm::SharedMemoryReadStream>(name, size, persist);
+                    return jsEngine_->newNumber(id);
+                } catch (const std::exception&) {
+                    return jsEngine_->newNumber(-1);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryCreateWriter",
+            jsEngine_->newFunction("__sharedMemoryCreateWriter", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNumber(-1);
+
+                try {
+                    const std::string name = jsEngine_->toString(args[0]);
+                    const std::size_t size = static_cast<std::size_t>(jsEngine_->toNumber(args.size() > 1 ? args[1] : jsEngine_->newNumber(65535)));
+                    const bool persist = args.size() > 2 ? jsEngine_->toBoolean(args[2]) : false;
+
+                    int id = nextSharedMemoryHandle_++;
+                    sharedMemoryWriters_[id] = std::make_unique<lsm::SharedMemoryWriteStream>(name, size, persist);
+                    return jsEngine_->newNumber(id);
+                } catch (const std::exception&) {
+                    return jsEngine_->newNumber(-1);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryWriteString",
+            jsEngine_->newFunction("__sharedMemoryWriteString", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.size() < 2) return jsEngine_->newBoolean(false);
+
+                try {
+                    const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                    const std::string value = jsEngine_->toString(args[1]);
+                    auto it = sharedMemoryWriters_.find(id);
+                    if (it == sharedMemoryWriters_.end() || !it->second) {
+                        return jsEngine_->newBoolean(false);
+                    }
+                    it->second->write(value);
+                    return jsEngine_->newBoolean(true);
+                } catch (const std::exception&) {
+                    return jsEngine_->newBoolean(false);
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryReadString",
+            jsEngine_->newFunction("__sharedMemoryReadString", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newNull();
+
+                try {
+                    const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                    auto it = sharedMemoryReaders_.find(id);
+                    if (it == sharedMemoryReaders_.end() || !it->second) {
+                        return jsEngine_->newNull();
+                    }
+                    return jsEngine_->newString(it->second->readString().c_str());
+                } catch (const std::exception&) {
+                    return jsEngine_->newNull();
+                }
+            })
+        );
+
+        jsEngine_->setGlobalProperty("__sharedMemoryClose",
+            jsEngine_->newFunction("__sharedMemoryClose", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) return jsEngine_->newBoolean(false);
+
+                const int id = static_cast<int>(jsEngine_->toNumber(args[0]));
+                bool closed = false;
+
+                auto writerIt = sharedMemoryWriters_.find(id);
+                if (writerIt != sharedMemoryWriters_.end()) {
+                    if (writerIt->second) {
+                        writerIt->second->close();
+                    }
+                    sharedMemoryWriters_.erase(writerIt);
+                    closed = true;
+                }
+
+                auto readerIt = sharedMemoryReaders_.find(id);
+                if (readerIt != sharedMemoryReaders_.end()) {
+                    if (readerIt->second) {
+                        readerIt->second->close();
+                    }
+                    sharedMemoryReaders_.erase(readerIt);
+                    closed = true;
+                }
+
+                return jsEngine_->newBoolean(closed);
+            })
+        );
+
+        const char* sharedMemoryPolyfill = R"JS(
+(function() {
+    class SharedMemoryWriter {
+        constructor(name, size = 65535, persistent = false) {
+            this.name = String(name);
+            this.size = Number(size) || 65535;
+            this.persistent = !!persistent;
+            this._id = __sharedMemoryCreateWriter(this.name, this.size, this.persistent);
+            if (this._id < 0) {
+                throw new Error('Failed to create shared memory writer');
+            }
+        }
+
+        writeString(value) {
+            return __sharedMemoryWriteString(this._id, String(value));
+        }
+
+        close() {
+            if (this._id >= 0) {
+                __sharedMemoryClose(this._id);
+                this._id = -1;
+            }
+        }
+    }
+
+    class SharedMemoryReader {
+        constructor(name, size = 65535, persistent = false) {
+            this.name = String(name);
+            this.size = Number(size) || 65535;
+            this.persistent = !!persistent;
+            this._id = __sharedMemoryCreateReader(this.name, this.size, this.persistent);
+            if (this._id < 0) {
+                throw new Error('Failed to open shared memory reader');
+            }
+        }
+
+        readString() {
+            return __sharedMemoryReadString(this._id);
+        }
+
+        close() {
+            if (this._id >= 0) {
+                __sharedMemoryClose(this._id);
+                this._id = -1;
+            }
+        }
+    }
+
+    globalThis.SharedMemoryWriter = SharedMemoryWriter;
+    globalThis.SharedMemoryReader = SharedMemoryReader;
+    globalThis.SharedMemory = {
+        Writer: SharedMemoryWriter,
+        Reader: SharedMemoryReader
+    };
+})();
+)JS";
+
+        jsEngine_->eval(sharedMemoryPolyfill, "shared-memory-polyfill.js");
     }
 
     void setupFetch() {
@@ -3380,11 +3696,18 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     int exitCode_ = 0;  // Exit code set by process.exit()
     int width_;
     int height_;
+    bool fullscreen_;
+    bool pendingResize_ = false;
+    int pendingResizeWidth_ = 0;
+    int pendingResizeHeight_ = 0;
 
     std::unique_ptr<webgpu::Context> webgpu_;
     std::unique_ptr<js::Engine> jsEngine_;
     std::unique_ptr<js::ModuleSystem> moduleSystem_;
     storage::LocalStorage localStorage_;
+    std::unordered_map<int, std::unique_ptr<lsm::SharedMemoryWriteStream>> sharedMemoryWriters_;
+    std::unordered_map<int, std::unique_ptr<lsm::SharedMemoryReadStream>> sharedMemoryReaders_;
+    int nextSharedMemoryHandle_ = 1;
 
     // requestAnimationFrame state
     struct RAFCallback {
@@ -3772,6 +4095,112 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         // In browsers, 'self' refers to the global object (same as 'this' at global scope)
         jsEngine_->setGlobalProperty("self", window);
 
+        // Mystral-native window controls. This is intentionally not a DOM API.
+        auto mystral = jsEngine_->newObject();
+        jsEngine_->setProperty(mystral, "setFullscreen",
+            jsEngine_->newFunction("setFullscreen", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                bool enabled = !fullscreen_;
+                if (!args.empty()) enabled = jsEngine_->toBoolean(args[0]);
+                setFullscreen(enabled);
+                return jsEngine_->newUndefined();
+            })
+        );
+        jsEngine_->setProperty(mystral, "toggleFullscreen",
+            jsEngine_->newFunction("toggleFullscreen", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                setFullscreen(!fullscreen_);
+                return jsEngine_->newUndefined();
+            })
+        );
+        jsEngine_->setProperty(mystral, "getWindowSize",
+            jsEngine_->newFunction("getWindowSize", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                auto size = jsEngine_->newObject();
+                jsEngine_->setProperty(size, "width", jsEngine_->newNumber(width_));
+                jsEngine_->setProperty(size, "height", jsEngine_->newNumber(height_));
+                return size;
+            })
+        );
+        jsEngine_->setProperty(mystral, "isFullscreen", jsEngine_->newBoolean(fullscreen_));
+
+        jsEngine_->setProperty(mystral, "openFileStream",
+            jsEngine_->newFunction("openFileStream", [this](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                if (args.empty()) {
+                    return jsEngine_->newNull();
+                }
+
+                const std::string path = NativeFileStream::normalizePath(jsEngine_->toString(args[0]));
+                auto stream = std::make_shared<NativeFileStream>();
+                if (!stream->open(path)) {
+                    std::cerr << "[Mystral] Failed to open file stream: " << path << std::endl;
+                    return jsEngine_->newNull();
+                }
+
+                const int64_t id = nextFileStreamId_++;
+                fileStreams_[id] = stream;
+
+                auto streamObj = jsEngine_->newObject();
+                jsEngine_->setProperty(streamObj, "id", jsEngine_->newNumber(static_cast<double>(id)));
+                jsEngine_->setProperty(streamObj, "path", jsEngine_->newString(path.c_str()));
+                jsEngine_->setProperty(streamObj, "size", jsEngine_->newNumber(static_cast<double>(stream->size)));
+                jsEngine_->setProperty(streamObj, "tell",
+                    jsEngine_->newFunction("tell", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNumber(0.0);
+                        return jsEngine_->newNumber(static_cast<double>(it->second->tell()));
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "seek",
+                    jsEngine_->newFunction("seek", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        if (args.empty()) return jsEngine_->newBoolean(false);
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newBoolean(false);
+                        const std::uint64_t offset = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        return jsEngine_->newBoolean(it->second->seek(offset));
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "read",
+                    jsEngine_->newFunction("read", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNull();
+                        std::uint64_t count = it->second->available();
+                        if (!args.empty()) {
+                            count = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        }
+                        const std::vector<uint8_t> data = it->second->read(count);
+                        if (data.empty()) {
+                            return jsEngine_->newArrayBuffer(nullptr, 0);
+                        }
+                        return jsEngine_->newArrayBuffer(const_cast<uint8_t*>(data.data()), data.size());
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "readSlice",
+                    jsEngine_->newFunction("readSlice", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        if (args.size() < 2) return jsEngine_->newNull();
+                        const auto it = fileStreams_.find(id);
+                        if (it == fileStreams_.end()) return jsEngine_->newNull();
+                        const std::uint64_t start = static_cast<std::uint64_t>(jsEngine_->toNumber(args[0]));
+                        const std::uint64_t count = static_cast<std::uint64_t>(jsEngine_->toNumber(args[1]));
+                        const std::vector<uint8_t> data = it->second->readSlice(start, count);
+                        if (data.empty()) {
+                            return jsEngine_->newArrayBuffer(nullptr, 0);
+                        }
+                        return jsEngine_->newArrayBuffer(const_cast<uint8_t*>(data.data()), data.size());
+                    })
+                );
+                jsEngine_->setProperty(streamObj, "close",
+                    jsEngine_->newFunction("close", [this, id](void* ctx, const std::vector<js::JSValueHandle>& args) {
+                        auto it = fileStreams_.find(id);
+                        if (it != fileStreams_.end()) {
+                            it->second->close();
+                            fileStreams_.erase(it);
+                        }
+                        return jsEngine_->newUndefined();
+                    })
+                );
+                return streamObj;
+            })
+        );
+        jsEngine_->setGlobalProperty("mystral", mystral);
+
         // Also set document as window.document (browsers have both)
         jsEngine_->setProperty(window, "document", document);
 
@@ -4047,19 +4476,28 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
     }
 
     void dispatchResizeEvent(const platform::ResizeEventData& e) {
-        // Update internal dimensions
-        width_ = e.width;
-        height_ = e.height;
+        pendingResizeWidth_ = e.width;
+        pendingResizeHeight_ = e.height;
+        pendingResize_ = true;
+    }
+
+    void applyPendingResize() {
+        if (!pendingResize_) return;
+        pendingResize_ = false;
+
+        width_ = pendingResizeWidth_;
+        height_ = pendingResizeHeight_;
 
         // Update window.innerWidth/innerHeight
         auto window = jsEngine_->getGlobal();
-        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(e.width));
-        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(e.height));
+        jsEngine_->setProperty(window, "innerWidth", jsEngine_->newNumber(width_));
+        jsEngine_->setProperty(window, "innerHeight", jsEngine_->newNumber(height_));
 
         auto event = jsEngine_->newObject();
         jsEngine_->setProperty(event, "type", jsEngine_->newString("resize"));
 
         dispatchToListeners("window", "resize", event);
+
     }
 
     void dispatchToListeners(const std::string& target, const std::string& eventType, js::JSValueHandle event) {

@@ -913,6 +913,10 @@ public:
         return isolate_;
     }
 
+    void* getRawContextHandle() override {
+        return &context_;
+    }
+
 private:
     static std::string toStdString(v8::Isolate* isolate, v8::Local<v8::Value> value) {
         v8::String::Utf8Value utf8(isolate, value);

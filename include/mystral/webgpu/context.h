@@ -14,6 +14,9 @@ struct WGPUSurfaceDescriptor;
 namespace mystral {
 namespace webgpu {
 
+// Reports whether the active adapter exposed BC texture compression.
+bool isTextureCompressionBCSupported();
+
 /**
  * WebGPU Context
  *

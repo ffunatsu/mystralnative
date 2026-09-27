@@ -45,4 +45,6 @@ output.json
 
 # Dependencies
 node_modules/
-third_party/
+third_party/*
+!third_party/infix/
+!third_party/infix/**
