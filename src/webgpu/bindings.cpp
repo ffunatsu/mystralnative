@@ -48,19 +48,7 @@ namespace canvas {
 }
 }
 
-// ============================================================================
-// OffscreenCanvas - stores canvas element state for getContext support
-// ============================================================================
-struct OffscreenCanvas {
-    int width = 300;
-    int height = 150;
-    mystral::js::JSValueHandle context2d;  // Cached 2D context (created on first getContext call)
-    bool hasContext2d = false;
-};
-
-// Global storage for offscreen canvases (prevents them from being destroyed)
-static std::unordered_map<int, std::unique_ptr<OffscreenCanvas>> g_offscreenCanvases;
-static int g_nextOffscreenCanvasId = 0;
+// OffscreenCanvas is defined inside namespace mystral::webgpu below
 
 #if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
 #include <webgpu/webgpu.h>
@@ -89,6 +77,32 @@ static WGPUQueue g_queue = nullptr;
 static WGPUSurface g_surface = nullptr;
 static WGPUInstance g_instance = nullptr;
 static js::Engine* g_engine = nullptr;
+
+// ============================================================================
+// OffscreenCanvas - stores canvas element state for getContext support
+// ============================================================================
+struct OffscreenCanvas {
+    int width = 300;
+    int height = 150;
+    mystral::js::JSValueHandle context2d;
+    bool hasContext2d = false;
+    mystral::js::JSValueHandle contextWebGPU;
+    bool hasWebGPU = false;
+    WGPUTexture offscreenTexture = nullptr;
+    uint32_t textureWidth = 0;
+    uint32_t textureHeight = 0;
+    WGPUTextureFormat format = WGPUTextureFormat_BGRA8Unorm;
+    ~OffscreenCanvas() {
+        if (offscreenTexture) {
+            wgpuTextureDestroy(offscreenTexture);
+            wgpuTextureRelease(offscreenTexture);
+            offscreenTexture = nullptr;
+        }
+    }
+};
+
+static std::unordered_map<int, std::unique_ptr<OffscreenCanvas>> g_offscreenCanvases;
+static int g_nextOffscreenCanvasId = 0;
 
 // Offscreen rendering support (for no-SDL mode)
 static WGPUTexture g_offscreenTexture = nullptr;
@@ -344,6 +358,202 @@ static WGPUTexture getCurrentSwapchainTexture() {
     return nullptr;
 #endif
 }
+
+#if defined(MYSTRAL_WEBGPU_WGPU) || defined(MYSTRAL_WEBGPU_DAWN)
+static js::JSValueHandle createOffscreenCanvasInstance(int width, int height) {
+    int canvasId = g_nextOffscreenCanvasId++;
+    auto offscreenCanvas = std::make_unique<OffscreenCanvas>();
+    offscreenCanvas->width = width;
+    offscreenCanvas->height = height;
+    OffscreenCanvas* canvasPtr = offscreenCanvas.get();
+    g_offscreenCanvases[canvasId] = std::move(offscreenCanvas);
+
+    auto element = g_engine->newObject();
+    g_engine->setPrivateData(element, reinterpret_cast<void*>(static_cast<intptr_t>(canvasId)));
+    g_engine->setProperty(element, "_offscreenCanvasId", g_engine->newNumber(canvasId));
+    g_engine->setProperty(element, "width", g_engine->newNumber(width));
+    g_engine->setProperty(element, "height", g_engine->newNumber(height));
+
+    std::string globalName = "__offscreenCanvas_" + std::to_string(canvasId);
+    g_engine->setGlobalProperty(globalName.c_str(), element);
+
+    auto getContextFn = g_engine->newFunction("getContext", [canvasId, canvasPtr](void* c, const std::vector<js::JSValueHandle>& contextArgs) -> js::JSValueHandle {
+        if (contextArgs.empty()) return g_engine->newNull();
+        std::string contextType = g_engine->toString(contextArgs[0]);
+        auto it = g_offscreenCanvases.find(canvasId);
+        if (it == g_offscreenCanvases.end()) return g_engine->newNull();
+        OffscreenCanvas* canvas = it->second.get();
+
+        if (contextType == "2d") {
+            if (canvas->hasContext2d) return canvas->context2d;
+            canvas->context2d = canvas::createCanvas2DContext(g_engine, canvas->width, canvas->height);
+            canvas->hasContext2d = true;
+            g_engine->protect(canvas->context2d);
+            return canvas->context2d;
+        }
+
+        if (contextType == "webgpu") {
+            if (canvas->hasWebGPU) return canvas->contextWebGPU;
+
+            g_engine->suspendFrameTracking();
+            auto canvasContext = g_engine->newObject();
+            std::string gName = "__offscreenCanvas_" + std::to_string(canvasId);
+            auto canvasElem = g_engine->getGlobalProperty(gName.c_str());
+            g_engine->setProperty(canvasContext, "canvas", canvasElem);
+
+            g_engine->setProperty(canvasContext, "configure",
+                g_engine->newFunction("configure", [canvasId](void* ctx, const std::vector<js::JSValueHandle>& args) -> js::JSValueHandle {
+                    if (args.empty()) return g_engine->newUndefined();
+                    auto descriptor = args[0];
+                    std::string format = g_engine->toString(g_engine->getProperty(descriptor, "format"));
+                    auto it = g_offscreenCanvases.find(canvasId);
+                    if (it != g_offscreenCanvases.end()) {
+                        it->second->format = stringToFormat(format);
+                        if (it->second->offscreenTexture) {
+                            wgpuTextureDestroy(it->second->offscreenTexture);
+                            wgpuTextureRelease(it->second->offscreenTexture);
+                            it->second->offscreenTexture = nullptr;
+                        }
+                    }
+                    return g_engine->newUndefined();
+                })
+            );
+
+            g_engine->setProperty(canvasContext, "unconfigure",
+                g_engine->newFunction("unconfigure", [canvasId](void* ctx, const std::vector<js::JSValueHandle>& args) -> js::JSValueHandle {
+                    auto it = g_offscreenCanvases.find(canvasId);
+                    if (it != g_offscreenCanvases.end() && it->second->offscreenTexture) {
+                        wgpuTextureDestroy(it->second->offscreenTexture);
+                        wgpuTextureRelease(it->second->offscreenTexture);
+                        it->second->offscreenTexture = nullptr;
+                    }
+                    return g_engine->newUndefined();
+                })
+            );
+
+            g_engine->setProperty(canvasContext, "getCurrentTexture",
+                g_engine->newFunction("getCurrentTexture", [canvasId](void* ctx, const std::vector<js::JSValueHandle>& args) -> js::JSValueHandle {
+                    auto it = g_offscreenCanvases.find(canvasId);
+                    if (it == g_offscreenCanvases.end()) {
+                        g_engine->throwException("Canvas not found");
+                        return g_engine->newUndefined();
+                    }
+                    OffscreenCanvas* cPtr = it->second.get();
+
+                    std::string gName = "__offscreenCanvas_" + std::to_string(canvasId);
+                    auto cElem = g_engine->getGlobalProperty(gName.c_str());
+                    if (!g_engine->isNull(cElem) && !g_engine->isUndefined(cElem)) {
+                        auto widthProp = g_engine->getProperty(cElem, "width");
+                        auto heightProp = g_engine->getProperty(cElem, "height");
+                        if (!g_engine->isUndefined(widthProp)) cPtr->width = static_cast<int>(g_engine->toNumber(widthProp));
+                        if (!g_engine->isUndefined(heightProp)) cPtr->height = static_cast<int>(g_engine->toNumber(heightProp));
+                    }
+
+                    uint32_t curWidth = static_cast<uint32_t>(std::max(1, cPtr->width));
+                    uint32_t curHeight = static_cast<uint32_t>(std::max(1, cPtr->height));
+
+                    if (cPtr->offscreenTexture && (cPtr->textureWidth != curWidth || cPtr->textureHeight != curHeight)) {
+                        wgpuTextureDestroy(cPtr->offscreenTexture);
+                        wgpuTextureRelease(cPtr->offscreenTexture);
+                        cPtr->offscreenTexture = nullptr;
+                    }
+
+                    if (!cPtr->offscreenTexture && g_device) {
+                        cPtr->textureWidth = curWidth;
+                        cPtr->textureHeight = curHeight;
+                        WGPUTextureDescriptor desc = {};
+                        desc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+                        desc.dimension = WGPUTextureDimension_2D;
+                        desc.size = { curWidth, curHeight, 1 };
+                        desc.format = cPtr->format;
+                        desc.mipLevelCount = 1;
+                        desc.sampleCount = 1;
+                        cPtr->offscreenTexture = wgpuDeviceCreateTexture(g_device, &desc);
+                    }
+
+                    WGPUTexture texture = cPtr->offscreenTexture;
+                    if (!texture) {
+                        g_engine->throwException("Failed to get offscreen texture");
+                        return g_engine->newUndefined();
+                    }
+
+                    uint64_t textureId = g_nextTextureId++;
+                    g_textureRegistry[textureId] = {texture, cPtr->format, curWidth, curHeight, 1, 1, WGPUTextureDimension_2D};
+
+                    g_engine->suspendFrameTracking();
+                    auto jsTexture = g_engine->newObject();
+                    g_engine->setPrivateData(jsTexture, texture);
+                    g_engine->setProperty(jsTexture, "width", g_engine->newNumber(curWidth));
+                    g_engine->setProperty(jsTexture, "height", g_engine->newNumber(curHeight));
+                    g_engine->setProperty(jsTexture, "depthOrArrayLayers", g_engine->newNumber(1));
+                    g_engine->setProperty(jsTexture, "format", g_engine->newString(formatToString(cPtr->format)));
+                    g_engine->setProperty(jsTexture, "_textureId", g_engine->newNumber((double)textureId));
+
+                    g_engine->setProperty(jsTexture, "createView",
+                        g_engine->newFunction("createView", [textureId](void* c, const std::vector<js::JSValueHandle>& a) -> js::JSValueHandle {
+                            auto it = g_textureRegistry.find(textureId);
+                            if (it == g_textureRegistry.end()) {
+                                g_engine->throwException("Texture not found in registry");
+                                return g_engine->newUndefined();
+                            }
+                            WGPUTexture tex = it->second.texture;
+                            if (!tex) {
+                                g_engine->throwException("No current texture");
+                                return g_engine->newUndefined();
+                            }
+                            WGPUTextureViewDescriptor viewDesc = {};
+                            viewDesc.format = it->second.format;
+                            viewDesc.dimension = WGPUTextureViewDimension_2D;
+                            viewDesc.baseMipLevel = 0;
+                            viewDesc.mipLevelCount = 1;
+                            viewDesc.baseArrayLayer = 0;
+                            viewDesc.arrayLayerCount = 1;
+                            viewDesc.aspect = WGPUTextureAspect_All;
+
+                            WGPUTextureView view = wgpuTextureCreateView(tex, &viewDesc);
+                            if (!view) {
+                                g_engine->throwException("Failed to create texture view");
+                                return g_engine->newUndefined();
+                            }
+
+                            g_engine->suspendFrameTracking();
+                            auto jsView = g_engine->newObject();
+                            g_engine->setPrivateData(jsView, view);
+
+                            g_engine->registerRelease(jsView, [view]() {
+                                wgpuTextureViewRelease(view);
+                            });
+
+                            g_engine->resumeFrameTracking();
+                            return jsView;
+                        })
+                    );
+
+                    g_engine->setProperty(jsTexture, "destroy",
+                        g_engine->newFunction("destroy", [](void* c, const std::vector<js::JSValueHandle>& a) -> js::JSValueHandle {
+                            return g_engine->newUndefined();
+                        })
+                    );
+
+                    g_engine->resumeFrameTracking();
+                    return jsTexture;
+                })
+            );
+
+            canvas->contextWebGPU = canvasContext;
+            canvas->hasWebGPU = true;
+            g_engine->protect(canvasContext);
+            g_engine->resumeFrameTracking();
+            return canvasContext;
+        }
+
+        return g_engine->newNull();
+    });
+
+    g_engine->setProperty(element, "getContext", getContextFn);
+    return element;
+}
+#endif
 
 /**
  * Initialize WebGPU bindings in the JS engine
@@ -1317,21 +1527,73 @@ bool initBindings(js::Engine* engine, void* wgpuInstance, void* wgpuDevice, void
                                 auto tagName = g_engine->getProperty(sourceObj, "tagName");
                                 std::string tagNameStr = g_engine->isUndefined(tagName) ? "" : g_engine->toString(tagName);
 
-                                if (tagNameStr == "CANVAS" || tagNameStr == "canvas") {
+                                if (tagNameStr == "CANVAS" || tagNameStr == "canvas" || tagNameStr.empty()) {
                                     // Get the canvas ID from private data or property
                                     auto canvasIdProp = g_engine->getProperty(sourceObj, "_offscreenCanvasId");
                                     if (!g_engine->isUndefined(canvasIdProp)) {
                                         int canvasId = (int)g_engine->toNumber(canvasIdProp);
                                         auto it = g_offscreenCanvases.find(canvasId);
-                                        if (it != g_offscreenCanvases.end() && it->second->hasContext2d) {
-                                            // Get pixel data from the 2D context
-                                            auto ctx2dHandle = it->second->context2d;
-                                            auto nativeCtx = static_cast<canvas::Canvas2DContext*>(g_engine->getPrivateData(ctx2dHandle));
-                                            if (nativeCtx) {
-                                                imgWidth = it->second->width;
-                                                imgHeight = it->second->height;
-                                                dataPtr = const_cast<void*>(static_cast<const void*>(nativeCtx->getPixelData()));
-                                                dataSize = nativeCtx->getPixelDataSize();
+                                        if (it != g_offscreenCanvases.end()) {
+                                            if (it->second->hasWebGPU && it->second->offscreenTexture) {
+                                                auto destination = args[1];
+                                                auto destTextureObj = g_engine->getProperty(destination, "texture");
+                                                WGPUTexture dstTex = (WGPUTexture)g_engine->getPrivateData(destTextureObj);
+                                                if (!dstTex) {
+                                                    g_engine->throwException("copyExternalImageToTexture: invalid destination texture");
+                                                    return g_engine->newUndefined();
+                                                }
+
+                                                uint32_t originX = 0, originY = 0, originZ = 0;
+                                                auto originVal = g_engine->getProperty(destination, "origin");
+                                                if (!g_engine->isUndefined(originVal) && g_engine->isArray(originVal)) {
+                                                    originX = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 0));
+                                                    originY = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 1));
+                                                    originZ = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(originVal, 2));
+                                                }
+
+                                                uint32_t copyW = static_cast<uint32_t>(std::max(1, it->second->width));
+                                                uint32_t copyH = static_cast<uint32_t>(std::max(1, it->second->height));
+                                                auto sizeVal = args[2];
+                                                if (g_engine->isArray(sizeVal)) {
+                                                    copyW = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeVal, 0));
+                                                    copyH = (uint32_t)g_engine->toNumber(g_engine->getPropertyIndex(sizeVal, 1));
+                                                } else if (!g_engine->isUndefined(sizeVal)) {
+                                                    auto widthVal = g_engine->getProperty(sizeVal, "width");
+                                                    auto heightVal = g_engine->getProperty(sizeVal, "height");
+                                                    if (!g_engine->isUndefined(widthVal)) copyW = (uint32_t)g_engine->toNumber(widthVal);
+                                                    if (!g_engine->isUndefined(heightVal)) copyH = (uint32_t)g_engine->toNumber(heightVal);
+                                                }
+
+                                                WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+                                                WGPUImageCopyTexture_Compat srcCopy = {};
+                                                srcCopy.texture = it->second->offscreenTexture;
+                                                srcCopy.mipLevel = 0;
+                                                srcCopy.origin = {0, 0, 0};
+                                                srcCopy.aspect = WGPUTextureAspect_All;
+
+                                                WGPUImageCopyTexture_Compat dstCopy = {};
+                                                dstCopy.texture = dstTex;
+                                                dstCopy.mipLevel = 0;
+                                                dstCopy.origin = {originX, originY, originZ};
+                                                dstCopy.aspect = WGPUTextureAspect_All;
+
+                                                WGPUExtent3D copyExt = {copyW, copyH, 1};
+                                                wgpuCommandEncoderCopyTextureToTexture(encoder, &srcCopy, &dstCopy, &copyExt);
+                                                WGPUCommandBuffer cmdBuf = wgpuCommandEncoderFinish(encoder, nullptr);
+                                                wgpuQueueSubmit(g_queue, 1, &cmdBuf);
+                                                wgpuCommandBufferRelease(cmdBuf);
+                                                wgpuCommandEncoderRelease(encoder);
+                                                return g_engine->newUndefined();
+                                            } else if (it->second->hasContext2d) {
+                                                // Get pixel data from the 2D context
+                                                auto ctx2dHandle = it->second->context2d;
+                                                auto nativeCtx = static_cast<canvas::Canvas2DContext*>(g_engine->getPrivateData(ctx2dHandle));
+                                                if (nativeCtx) {
+                                                    imgWidth = it->second->width;
+                                                    imgHeight = it->second->height;
+                                                    dataPtr = const_cast<void*>(static_cast<const void*>(nativeCtx->getPixelData()));
+                                                    dataSize = nativeCtx->getPixelDataSize();
+                                                }
                                             }
                                         }
                                     }
@@ -4382,28 +4644,24 @@ class HTMLCanvasElement {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-// OffscreenCanvas - For type checking
+// OffscreenCanvas - creates dedicated offscreen WebGPU/2D canvas
 class OffscreenCanvas {
     constructor(width, height) {
-        this.width = width || 300;
-        this.height = height || 150;
-        this._contextType = null;
-        this._context = null;
-    }
-
-    getContext(type, options) {
-        if (type === '2d') {
-            // For basic 2D context needs
-            if (!this._context) {
-                this._context = { canvas: this };
-            }
-            return this._context;
-        }
-        return null;
+        return createOffscreenCanvas(width || 300, height || 150);
     }
 }
 globalThis.OffscreenCanvas = OffscreenCanvas;
 )";
+    engine->setGlobalProperty("createOffscreenCanvas",
+        engine->newFunction("createOffscreenCanvas", [](void* ctx, const std::vector<js::JSValueHandle>& args) -> js::JSValueHandle {
+            int width = 300;
+            int height = 150;
+            if (args.size() >= 1) width = static_cast<int>(g_engine->toNumber(args[0]));
+            if (args.size() >= 2) height = static_cast<int>(g_engine->toNumber(args[1]));
+            return createOffscreenCanvasInstance(width, height);
+        })
+    );
+
     engine->eval(imageBitmapPolyfill, "imageBitmap-polyfill.js");
 
     // =========================================================================
