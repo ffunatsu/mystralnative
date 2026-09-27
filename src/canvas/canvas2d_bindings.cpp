@@ -331,6 +331,37 @@ js::JSValueHandle createCanvas2DJSObject(js::Engine* engine, Canvas2DContext* ct
         })
     );
 
+    // rect(x, y, width, height)
+    engine->setProperty(jsCtx, "rect",
+        engine->newFunction("rect", [capturedCtx](void* c, const std::vector<js::JSValueHandle>& args) {
+            if (capturedCtx && args.size() >= 4) {
+                capturedCtx->rect(
+                    static_cast<float>(g_jsEngine->toNumber(args[0])),
+                    static_cast<float>(g_jsEngine->toNumber(args[1])),
+                    static_cast<float>(g_jsEngine->toNumber(args[2])),
+                    static_cast<float>(g_jsEngine->toNumber(args[3]))
+                );
+            }
+            return g_jsEngine->newUndefined();
+        })
+    );
+
+    // arcTo(x1, y1, x2, y2, radius)
+    engine->setProperty(jsCtx, "arcTo",
+        engine->newFunction("arcTo", [capturedCtx](void* c, const std::vector<js::JSValueHandle>& args) {
+            if (capturedCtx && args.size() >= 5) {
+                capturedCtx->arcTo(
+                    static_cast<float>(g_jsEngine->toNumber(args[0])),
+                    static_cast<float>(g_jsEngine->toNumber(args[1])),
+                    static_cast<float>(g_jsEngine->toNumber(args[2])),
+                    static_cast<float>(g_jsEngine->toNumber(args[3])),
+                    static_cast<float>(g_jsEngine->toNumber(args[4]))
+                );
+            }
+            return g_jsEngine->newUndefined();
+        })
+    );
+
     // fill()
     engine->setProperty(jsCtx, "fill",
         engine->newFunction("fill", [capturedCtx](void* c, const std::vector<js::JSValueHandle>& args) {
